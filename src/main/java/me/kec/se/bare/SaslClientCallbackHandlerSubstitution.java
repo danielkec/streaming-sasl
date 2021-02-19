@@ -17,7 +17,6 @@
 
 package me.kec.se.bare;
 
-import java.security.AccessController;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,116 +32,89 @@ import javax.security.sasl.AuthorizeCallback;
 import javax.security.sasl.RealmCallback;
 
 import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.KeepOriginal;
-import com.oracle.svm.core.annotate.RecomputeFieldValue;
+import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.util.ReflectionUtil;
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.config.SaslConfigs;
-import org.apache.kafka.common.config.types.Password;
-import org.apache.kafka.common.security.JaasContext;
 import org.apache.kafka.common.security.auth.AuthenticateCallbackHandler;
 import org.apache.kafka.common.security.auth.SaslExtensions;
 import org.apache.kafka.common.security.auth.SaslExtensionsCallback;
 import org.apache.kafka.common.security.authenticator.LoginManager;
-import org.apache.kafka.common.security.plain.internals.PlainSaslServerProvider;
 import org.apache.kafka.common.security.scram.ScramExtensionsCallback;
 import org.apache.kafka.common.security.scram.internals.ScramMechanism;
-import org.apache.kafka.common.utils.Utils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @TargetClass(org.apache.kafka.common.security.authenticator.SaslClientCallbackHandler.class)
 final class SaslClientCallbackHandlerSubstitution implements AuthenticateCallbackHandler {
 
     @Alias
-    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.None)
     String mechanism;
 
-//    @Inject
-//    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.None)
-//    Subject subject;
-//
-//    @Inject
-//    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.None)
-//    Map<String, ?> sharedState;
+    @Inject
+    Logger LOGGER;
+
+    @Inject
+    Subject subject;
 
     @Substitute
     public SaslClientCallbackHandlerSubstitution() {
+        LOGGER = LoggerFactory.getLogger(LoginManager.class);
     }
 
     @Override
     @Substitute
     public void configure(Map<String, ?> configs, String saslMechanism, List<AppConfigurationEntry> jaasConfigEntries) {
         this.mechanism = saslMechanism;
-        PlainSaslServerProvider.initialize();
-        System.out.println("Configuring " + saslMechanism);
-//        for (AppConfigurationEntry entry : jaasConfigEntries) {
-//            System.out.println(jaasConfigEntries.toArray());
-//            try {
-//                if (subject == null) {
-//                    subject = new Subject();
-//                }
-//                if (sharedState == null) {
-//                    sharedState = new HashMap<>();
-//                }
-//                LoginModule result = Utils.newInstance(entry.getLoginModuleName(), LoginModule.class);
-//                result.initialize(subject, this, sharedState, entry.getOptions());
-//            } catch (ClassNotFoundException e) {
-//                throw new RuntimeException(e);
-//            }
-//        }
+        this.subject = null;
 
-        // static configs (broker or client)
-//        private static final Map<LoginManager.LoginMetadata<String>, LoginManager> STATIC_INSTANCES = new HashMap<>();
+        int entrySize = jaasConfigEntries.size();
+        if (entrySize == 0) {
+            LOGGER.warn("Missing JAAS config entry, missing or malformed sasl.jaas.config property.");
+            return;
+        } else if (entrySize > 1) {
+            LOGGER.warn("Multiple JAAS config entries, Kafka client's sasl.jaas.config can have only one JAAS config entry.");
+            return;
+        }
 
-        // dynamic configs (broker or client)
-//        private static final Map<LoginManager.LoginMetadata<Password>, LoginManager> DYNAMIC_INSTANCES = new HashMap<>();
+        AppConfigurationEntry jaasConfigEntry = jaasConfigEntries.get(0);
+        String jaasLoginModuleName = jaasConfigEntry.getLoginModuleName();
+        subject = new Subject();
 
-        // final Map<Object, LoginManager>  = ReflectionUtil.readStaticField(LoginManager.class, "STATIC_INSTANCES");
-        // new LoginMetadata<>(jaasContext.name(), loginClass, loginCallbackClass);
-       // Reflection.
-//        Subject subject = Subject.getSubject(AccessController.getContext());
-//        try {
-//            for (AppConfigurationEntry entry : jaasConfigEntries) {
-//                LoginModule result = Utils.newInstance(entry.getLoginModuleName(), LoginModule.class);
-//                result.initialize(subject, this, Map.of(), entry.getOptions());
-//            }
-//        } catch (ClassNotFoundException e) {
-//            throw new RuntimeException(e);
-//        }
+        try {
+            Class.forName(jaasLoginModuleName)
+                    .asSubclass(LoginModule.class)
+                    .getDeclaredConstructor()
+                    .newInstance()
+                    .initialize(subject, this, new HashMap<>(), jaasConfigEntry.getOptions());
+        } catch (ReflectiveOperationException e) {
+            throw new KafkaException("Can't instantiate JAAS login module" + jaasLoginModuleName, e);
+        }
     }
 
     @Override
     @Substitute
     public void handle(Callback[] callbacks) throws UnsupportedCallbackException {
-        System.out.println("Handling " + callbacks.length);
-        System.out.println("Mechanism " + mechanism);
+        // Subject.getSubject doesn't return proper subject in native image
+        // Remove substitution when https://github.com/oracle/graal/issues/2745 is fixed
+        // Subject subject = Subject.getSubject(AccessController.getContext());
 
-
-//        Subject subject = Subject.getSubject(acc);
-        //LoginManager.acquireLoginManager(JaasContext.loadClientContext());
-        Subject subject = Subject.getSubject(AccessController.getContext());
-        System.out.println("Subject: " + subject);
-        System.out.println("ac: " + AccessController.getContext().getClass().getName());
         for (Callback callback : callbacks) {
-            System.out.println("Callback " + callback.getClass());
             if (callback instanceof NameCallback) {
                 NameCallback nc = (NameCallback) callback;
                 if (subject != null && !subject.getPublicCredentials(String.class).isEmpty()) {
-                    System.out.println("Name subject " + subject.getPublicCredentials(String.class).iterator().next());
                     nc.setName(subject.getPublicCredentials(String.class).iterator().next());
                 } else {
-                    System.out.println("Name " + nc.getDefaultName());
                     nc.setName(nc.getDefaultName());
                 }
             } else if (callback instanceof PasswordCallback) {
                 if (subject != null && !subject.getPrivateCredentials(String.class).isEmpty()) {
                     char[] password = subject.getPrivateCredentials(String.class).iterator().next().toCharArray();
-                    System.out.println("Pass subject " + new String(password));
                     ((PasswordCallback) callback).setPassword(password);
                 } else {
                     String errorMessage = "Could not login: the client is being asked for a password, but the Kafka" +
                             " client code does not currently support obtaining a password from the user.";
-                    System.out.println("Pass subject " + errorMessage);
                     throw new UnsupportedCallbackException(callback, errorMessage);
                 }
             } else if (callback instanceof RealmCallback) {
@@ -176,7 +148,6 @@ final class SaslClientCallbackHandlerSubstitution implements AuthenticateCallbac
 
     @Override
     @Substitute
-    @KeepOriginal
     public void close() {
     }
 }
